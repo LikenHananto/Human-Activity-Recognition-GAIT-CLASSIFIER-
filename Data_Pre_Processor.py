@@ -7,44 +7,73 @@ ACC_COLS  = ['Var2', 'Var3', 'Var4']
 GYRO_COLS = ['Var5', 'Var6', 'Var7']
 
 
-def separate_gravity_body(df, fs=100, cutoff=20, acc_cols=None, gyro_cols=None):
+def apply_noise_filter(df, fs=100, cutoff=20, cols=None):
     """
-    Applies a Butterworth low-pass filter to separate gravitational and body
-    components from accelerometer AND gyroscope signals.
+    Stage 1: Apply a 20 Hz low-pass Butterworth filter to remove noise.
+    Replaces the raw signal in-place with the filtered version.
 
-    For accelerometers: gravity  = low-pass filtered signal
-                        body     = raw - gravity
-    For gyroscopes:     static   = low-pass filtered signal (slow drift/orientation)
-                        dynamic  = raw - static            (fast rotational movement)
+    Parameters:
+        df     : DataFrame with DatetimeIndex
+        fs     : Sampling frequency in Hz (default 100)
+        cutoff : Low-pass cutoff in Hz (default 20)
+        cols   : Columns to filter. Defaults to ACC_COLS + GYRO_COLS
+    """
+    df = df.copy()
+
+    if cols is None:
+        cols = ACC_COLS + GYRO_COLS
+
+    nyquist = fs / 2
+    b, a = butter(N=4, Wn=cutoff / nyquist, btype='low', analog=False)
+
+    print(f"  Applying 20 Hz noise filter to: {cols}")
+    for col in cols:
+        if col in df.columns:
+            df[col] = filtfilt(b, a, df[col].values)
+
+    return df
+
+
+def separate_gravity_body(df, fs=100, cutoff=0.3, acc_cols=None, gyro_cols=None):
+    """
+    Stage 2: Apply a 0.3 Hz low-pass filter to separate gravity and body
+    components from the noise-filtered signals.
+
+    For accelerometers:
+        <col>_gravity = 0.3 Hz low-pass  (quasi-static gravitational component)
+        <col>_body    = filtered - gravity (dynamic body acceleration)
+
+    For gyroscopes:
+        <col>_static  = 0.3 Hz low-pass  (slow orientation drift)
+        <col>_dynamic = filtered - static (fast rotational movement)
+
+    Parameters:
+        df        : DataFrame output of apply_noise_filter
+        fs        : Sampling frequency in Hz (default 100)
+        cutoff    : Low-pass cutoff in Hz (default 0.3)
+        acc_cols  : Accelerometer columns (default ACC_COLS)
+        gyro_cols : Gyroscope columns (default GYRO_COLS)
     """
     df = df.copy()
 
     if acc_cols is None:
-        acc_cols  = [c for c in df.columns if 'acc' in c.lower()]
+        acc_cols  = ACC_COLS
     if gyro_cols is None:
-        gyro_cols = [c for c in df.columns if 'gyro' in c.lower() or 'gyr' in c.lower()]
-
-    all_cols = acc_cols + gyro_cols
-    if not all_cols:
-        print("  Warning: No accelerometer or gyroscope columns found, skipping filter.")
-        return df
-
-    print(f"  Filtering acc cols:  {acc_cols}")
-    print(f"  Filtering gyro cols: {gyro_cols}")
+        gyro_cols = GYRO_COLS
 
     nyquist = fs / 2
-    normalized_cutoff = cutoff / nyquist
-    b, a = butter(N=4, Wn=normalized_cutoff, btype='low', analog=False)
+    b, a = butter(N=4, Wn=cutoff / nyquist, btype='low', analog=False)
 
-    # Map Var2/3/4 → x/y/z for readable output column names
     acc_axis_map  = {col: ax for col, ax in zip(acc_cols,  ['x', 'y', 'z'])}
     gyro_axis_map = {col: ax for col, ax in zip(gyro_cols, ['x', 'y', 'z'])}
 
+    print(f"  Applying 0.3 Hz gravity/body separation to acc:  {acc_cols}")
     for col in acc_cols:
         ax = acc_axis_map[col]
         df[f"acc_{ax}_gravity"] = filtfilt(b, a, df[col].values)
         df[f"acc_{ax}_body"]    = df[col].values - df[f"acc_{ax}_gravity"].values
 
+    print(f"  Applying 0.3 Hz static/dynamic separation to gyro: {gyro_cols}")
     for col in gyro_cols:
         ax = gyro_axis_map[col]
         df[f"gyro_{ax}_static"]  = filtfilt(b, a, df[col].values)
@@ -96,43 +125,57 @@ def align_sensors(df_lower, df_upper, time_col='time', freq='10ms'):
 
 def sliding_window(data, window_size=128, step_size=64, label_col='Task', fs=100):
     """
-    Extracts features from each sliding window:
-      - Mean and std for all columns
-      - Dominant FFT frequency for raw acc/gyro axes only (ACC_COLS + GYRO_COLS)
+    Extracts per-window features:
+      - Mean and std for ALL columns (raw filtered, gravity, body, static, dynamic)
+      - Dominant FFT frequency for body acc and gyro dynamic columns only
     """
     feature_cols = [c for c in data.columns if c != label_col]
-    rows = []
-
-    # Pre-compute frequency bins once — same for every window given fixed size
-    freqs = np.fft.rfftfreq(window_size, d=1.0 / fs)
 
     # Columns eligible for dominant frequency extraction
-    fft_eligible_cols = ACC_COLS + GYRO_COLS
+    fft_cols = (
+        [f"acc_{ax}_body"    for ax in ['x', 'y', 'z']] +
+        [f"gyro_{ax}_dynamic" for ax in ['x', 'y', 'z']]
+    )
+    # Only keep fft_cols that actually exist in this dataframe
+    fft_cols = [c for c in fft_cols if c in feature_cols]
 
+    # Pre-compute frequency bins once — same for every window
+    freqs = np.fft.rfftfreq(window_size, d=1.0 / fs)
+
+    rows = []
     for i in range(0, len(data) - window_size + 1, step_size):
         window = data.iloc[i:i + window_size]
-        task = window[label_col].values[-1]
-        window_features = window[feature_cols]
+        """""
+        task = window[label_col].values[-1]   # current: last sample
 
+        # ── Option A: majority vote ──────────────────────────────────────
+        from scipy.stats import mode
+        task = mode(window[label_col].values, keepdims=False).mode
+        """""
+        # ── Option B: drop mixed windows (recommended) ───────────────────
+        labels = window[label_col].unique()
+        if len(labels) > 1:
+            continue          # skip this window entirely — mixed activity
+        task = labels[0]
+
+        window_features = window[feature_cols]
+        
         mean_values = window_features.mean()
         std_values  = window_features.std()
 
         row_dict = {}
 
+        # ── Time-domain: mean + std for all columns ──────────────────────────
         for col in feature_cols:
-            # ── Time-domain features ─────────────────────────────────────────
             row_dict[f"{col}_mean"] = mean_values[col]
             row_dict[f"{col}_std"]  = std_values[col]
 
-            # ── Frequency-domain feature (raw axes only) ─────────────────────
-            if col in fft_eligible_cols:
-                signal = window[col].values
-                fft_magnitude = np.abs(np.fft.rfft(signal))
-                # Zero out DC component (index 0) to avoid gravity offset
-                # dominating as a 0 Hz "frequency"
-                fft_magnitude[0] = 0
-                dominant_freq = freqs[np.argmax(fft_magnitude)]
-                row_dict[f"{col}_dominant_freq"] = dominant_freq
+        # ── Frequency-domain: dominant freq for body acc + gyro dynamic ──────
+        for col in fft_cols:
+            signal = window[col].values
+            fft_magnitude = np.abs(np.fft.rfft(signal))
+            fft_magnitude[0] = 0  # zero DC component to ignore mean offset
+            row_dict[f"{col}_dominant_freq"] = freqs[np.argmax(fft_magnitude)]
 
         row_dict[label_col] = task
         rows.append(row_dict)
@@ -166,22 +209,28 @@ def preprocess_lab_data(base_path="Raw_Data/Labeled", window_size=128, step_size
         )
         aligned_pairs.append((df_lower, df_upper))
 
-    # ── Separate gravity/body and static/dynamic components ──────────────────
-    filtered_pairs = []
+    # ── Stage 1: 20 Hz noise filter (replaces raw signals) ───────────────────
+    denoised_pairs = []
     for pair_idx, (df_lower, df_upper) in enumerate(aligned_pairs):
-        print(f"Separating gravity/body components for pair {pair_idx}...")
-        df_lower = separate_gravity_body(df_lower, fs=100, cutoff=20,
-                                         acc_cols=ACC_COLS, gyro_cols=GYRO_COLS)
-        df_upper = separate_gravity_body(df_upper, fs=100, cutoff=20,
-                                         acc_cols=ACC_COLS, gyro_cols=GYRO_COLS)
+        print(f"Stage 1 — Noise filter for pair {pair_idx}...")
+        df_lower = apply_noise_filter(df_lower, fs=100, cutoff=20)
+        df_upper = apply_noise_filter(df_upper, fs=100, cutoff=20)
+        denoised_pairs.append((df_lower, df_upper))
+
+    # ── Stage 2: 0.3 Hz gravity/body separation ───────────────────────────────
+    filtered_pairs = []
+    for pair_idx, (df_lower, df_upper) in enumerate(denoised_pairs):
+        print(f"Stage 2 — Gravity/body separation for pair {pair_idx}...")
+        df_lower = separate_gravity_body(df_lower, fs=100, cutoff=0.3)
+        df_upper = separate_gravity_body(df_upper, fs=100, cutoff=0.3)
         filtered_pairs.append((df_lower, df_upper))
 
-    # ── Sliding window + suffix renaming ─────────────────────────────────────
+    # ── Stage 3: Sliding window + suffix renaming ─────────────────────────────
     session_dfs = []
     for pair_idx, (df_lower, df_upper) in enumerate(filtered_pairs):
         pair_windowed = []
         for sensor_df, suffix in [(df_lower, '_lower'), (df_upper, '_upper')]:
-            print(f"  Applying sliding window to pair {pair_idx}, suffix {suffix}...")
+            print(f"  Stage 3 — Sliding window for pair {pair_idx}, suffix {suffix}...")
             df_w = sliding_window(sensor_df, window_size=window_size,
                                   step_size=step_size, fs=100)
             new_columns = {col: f"{col}{suffix}" for col in df_w.columns if col != 'Task'}

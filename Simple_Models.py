@@ -13,7 +13,7 @@ from Trainer import train_and_evaluate_model
 save_path="Results_Plots"
 # Load dataset
 # df = preprocess_lab_data(base_path="Labeled", window_size=128, step_size=16, save_path=None)
-df = pd.read_csv("Processed_Data\lab_W128_S64.csv")
+df = pd.read_csv("Processed_Data\lab_W256_S128.csv")
 Y = df['Task']
 X = df.drop(columns=['Task'])
 # Encode the labels
@@ -26,7 +26,7 @@ for i, label in enumerate(le.classes_):
     print(f"{i}: {label}")
 # Split the data into training and testing sets making sure to keep the same ratio of classes in both sets
 from sklearn.model_selection import train_test_split
-X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, stratify=Y, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.3, stratify=Y, random_state=42)
 # convert to numpy arrays
 X_train = X_train.to_numpy()
 X_test = X_test.to_numpy()
