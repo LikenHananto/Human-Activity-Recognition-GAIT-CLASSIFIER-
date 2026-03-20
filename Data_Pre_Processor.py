@@ -9,17 +9,10 @@ GYRO_COLS = ['Var5', 'Var6', 'Var7']
 
 def apply_noise_filter(df, fs=100, cutoff=20, cols=None):
     """
-    Stage 1: Apply a 20 Hz low-pass Butterworth filter to remove noise.
-    Replaces the raw signal in-place with the filtered version.
-
-    Parameters:
-        df     : DataFrame with DatetimeIndex
-        fs     : Sampling frequency in Hz (default 100)
-        cutoff : Low-pass cutoff in Hz (default 20)
-        cols   : Columns to filter. Defaults to ACC_COLS + GYRO_COLS
+    Stage 1: 20 Hz low-pass Butterworth filter to remove noise.
+    Replaces raw signal in-place with the filtered version.
     """
     df = df.copy()
-
     if cols is None:
         cols = ACC_COLS + GYRO_COLS
 
@@ -30,32 +23,21 @@ def apply_noise_filter(df, fs=100, cutoff=20, cols=None):
     for col in cols:
         if col in df.columns:
             df[col] = filtfilt(b, a, df[col].values)
-
     return df
 
 
 def separate_gravity_body(df, fs=100, cutoff=0.3, acc_cols=None, gyro_cols=None):
     """
-    Stage 2: Apply a 0.3 Hz low-pass filter to separate gravity and body
-    components from the noise-filtered signals.
+    Stage 2: 0.3 Hz low-pass filter to separate gravity/body and static/dynamic.
 
     For accelerometers:
-        <col>_gravity = 0.3 Hz low-pass  (quasi-static gravitational component)
-        <col>_body    = filtered - gravity (dynamic body acceleration)
-
+        acc_x/y/z_gravity = 0.3 Hz low-pass
+        acc_x/y/z_body    = filtered - gravity
     For gyroscopes:
-        <col>_static  = 0.3 Hz low-pass  (slow orientation drift)
-        <col>_dynamic = filtered - static (fast rotational movement)
-
-    Parameters:
-        df        : DataFrame output of apply_noise_filter
-        fs        : Sampling frequency in Hz (default 100)
-        cutoff    : Low-pass cutoff in Hz (default 0.3)
-        acc_cols  : Accelerometer columns (default ACC_COLS)
-        gyro_cols : Gyroscope columns (default GYRO_COLS)
+        gyro_x/y/z_static  = 0.3 Hz low-pass
+        gyro_x/y/z_dynamic = filtered - static
     """
     df = df.copy()
-
     if acc_cols is None:
         acc_cols  = ACC_COLS
     if gyro_cols is None:
@@ -67,17 +49,46 @@ def separate_gravity_body(df, fs=100, cutoff=0.3, acc_cols=None, gyro_cols=None)
     acc_axis_map  = {col: ax for col, ax in zip(acc_cols,  ['x', 'y', 'z'])}
     gyro_axis_map = {col: ax for col, ax in zip(gyro_cols, ['x', 'y', 'z'])}
 
-    print(f"  Applying 0.3 Hz gravity/body separation to acc:  {acc_cols}")
+    print(f"  Separating gravity/body for acc:  {acc_cols}")
     for col in acc_cols:
         ax = acc_axis_map[col]
         df[f"acc_{ax}_gravity"] = filtfilt(b, a, df[col].values)
         df[f"acc_{ax}_body"]    = df[col].values - df[f"acc_{ax}_gravity"].values
 
-    print(f"  Applying 0.3 Hz static/dynamic separation to gyro: {gyro_cols}")
+    print(f"  Separating static/dynamic for gyro: {gyro_cols}")
     for col in gyro_cols:
         ax = gyro_axis_map[col]
         df[f"gyro_{ax}_static"]  = filtfilt(b, a, df[col].values)
         df[f"gyro_{ax}_dynamic"] = df[col].values - df[f"gyro_{ax}_static"].values
+
+    return df
+
+
+def compute_jerk(df, fs=100):
+    """
+    Stage 3: Compute jerk (rate of change) for body acc and gyro dynamic columns.
+
+    Jerk = diff(signal) * fs
+    Produces new columns:
+        acc_x/y/z_body_jerk
+        gyro_x/y/z_dynamic_jerk
+
+    The first sample is set to 0 (no previous sample to diff against).
+    """
+    df = df.copy()
+
+    jerk_source_cols = (
+        [f"acc_{ax}_body"     for ax in ['x', 'y', 'z']] +
+        [f"gyro_{ax}_dynamic" for ax in ['x', 'y', 'z']]
+    )
+
+    # Only process columns that actually exist
+    jerk_source_cols = [c for c in jerk_source_cols if c in df.columns]
+
+    print(f"  Computing jerk for: {jerk_source_cols}")
+    for col in jerk_source_cols:
+        jerk = np.diff(df[col].values, prepend=df[col].values[0]) * fs
+        df[f"{col}_jerk"] = jerk
 
     return df
 
@@ -126,40 +137,37 @@ def align_sensors(df_lower, df_upper, time_col='time', freq='10ms'):
 def sliding_window(data, window_size=128, step_size=64, label_col='Task', fs=100):
     """
     Extracts per-window features:
-      - Mean and std for ALL columns (raw filtered, gravity, body, static, dynamic)
-      - Dominant FFT frequency for body acc and gyro dynamic columns only
+      - Mean and std for ALL columns
+      - Dominant FFT frequency for body acc, gyro dynamic, and their jerks
+      - Mixed windows (more than one unique label) are dropped
     """
     feature_cols = [c for c in data.columns if c != label_col]
 
     # Columns eligible for dominant frequency extraction
     fft_cols = (
-        [f"acc_{ax}_body"    for ax in ['x', 'y', 'z']] +
-        [f"gyro_{ax}_dynamic" for ax in ['x', 'y', 'z']]
+        [f"acc_{ax}_body"          for ax in ['x', 'y', 'z']] +
+        [f"gyro_{ax}_dynamic"      for ax in ['x', 'y', 'z']] +
+        [f"acc_{ax}_body_jerk"     for ax in ['x', 'y', 'z']] +
+        [f"gyro_{ax}_dynamic_jerk" for ax in ['x', 'y', 'z']]
     )
-    # Only keep fft_cols that actually exist in this dataframe
     fft_cols = [c for c in fft_cols if c in feature_cols]
 
-    # Pre-compute frequency bins once — same for every window
     freqs = np.fft.rfftfreq(window_size, d=1.0 / fs)
 
     rows = []
+    dropped = 0
+
     for i in range(0, len(data) - window_size + 1, step_size):
         window = data.iloc[i:i + window_size]
-        """""
-        task = window[label_col].values[-1]   # current: last sample
 
-        # ── Option A: majority vote ──────────────────────────────────────
-        from scipy.stats import mode
-        task = mode(window[label_col].values, keepdims=False).mode
-        """""
-        # ── Option B: drop mixed windows (recommended) ───────────────────
-        labels = window[label_col].unique()
-        if len(labels) > 1:
-            continue          # skip this window entirely — mixed activity
-        task = labels[0]
+        # ── Drop mixed-label windows ─────────────────────────────────────────
+        unique_labels = window[label_col].unique()
+        if len(unique_labels) > 1:
+            dropped += 1
+            continue
+        task = unique_labels[0]
 
         window_features = window[feature_cols]
-        
         mean_values = window_features.mean()
         std_values  = window_features.std()
 
@@ -170,16 +178,17 @@ def sliding_window(data, window_size=128, step_size=64, label_col='Task', fs=100
             row_dict[f"{col}_mean"] = mean_values[col]
             row_dict[f"{col}_std"]  = std_values[col]
 
-        # ── Frequency-domain: dominant freq for body acc + gyro dynamic ──────
+        # ── Frequency-domain: dominant freq for body, dynamic, and jerks ─────
         for col in fft_cols:
             signal = window[col].values
             fft_magnitude = np.abs(np.fft.rfft(signal))
-            fft_magnitude[0] = 0  # zero DC component to ignore mean offset
+            fft_magnitude[0] = 0  # zero DC component
             row_dict[f"{col}_dominant_freq"] = freqs[np.argmax(fft_magnitude)]
 
         row_dict[label_col] = task
         rows.append(row_dict)
 
+    print(f"  Dropped {dropped} mixed-label windows")
     return pd.DataFrame(rows)
 
 
@@ -209,7 +218,7 @@ def preprocess_lab_data(base_path="Raw_Data/Labeled", window_size=128, step_size
         )
         aligned_pairs.append((df_lower, df_upper))
 
-    # ── Stage 1: 20 Hz noise filter (replaces raw signals) ───────────────────
+    # ── Stage 1: 20 Hz noise filter ──────────────────────────────────────────
     denoised_pairs = []
     for pair_idx, (df_lower, df_upper) in enumerate(aligned_pairs):
         print(f"Stage 1 — Noise filter for pair {pair_idx}...")
@@ -225,12 +234,20 @@ def preprocess_lab_data(base_path="Raw_Data/Labeled", window_size=128, step_size
         df_upper = separate_gravity_body(df_upper, fs=100, cutoff=0.3)
         filtered_pairs.append((df_lower, df_upper))
 
-    # ── Stage 3: Sliding window + suffix renaming ─────────────────────────────
-    session_dfs = []
+    # ── Stage 3: Jerk computation ─────────────────────────────────────────────
+    jerk_pairs = []
     for pair_idx, (df_lower, df_upper) in enumerate(filtered_pairs):
+        print(f"Stage 3 — Jerk computation for pair {pair_idx}...")
+        df_lower = compute_jerk(df_lower, fs=100)
+        df_upper = compute_jerk(df_upper, fs=100)
+        jerk_pairs.append((df_lower, df_upper))
+
+    # ── Stage 4: Sliding window + suffix renaming ─────────────────────────────
+    session_dfs = []
+    for pair_idx, (df_lower, df_upper) in enumerate(jerk_pairs):
         pair_windowed = []
         for sensor_df, suffix in [(df_lower, '_lower'), (df_upper, '_upper')]:
-            print(f"  Stage 3 — Sliding window for pair {pair_idx}, suffix {suffix}...")
+            print(f"  Stage 4 — Sliding window for pair {pair_idx}, suffix {suffix}...")
             df_w = sliding_window(sensor_df, window_size=window_size,
                                   step_size=step_size, fs=100)
             new_columns = {col: f"{col}{suffix}" for col in df_w.columns if col != 'Task'}
